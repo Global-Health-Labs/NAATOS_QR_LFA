@@ -111,9 +111,9 @@ class TestConsumable:
         return (x1y1.astype(int), x2y2.astype(int))
     
     def get_peak_intervals(self) -> np.array:
-        x_values = test._mm_to_pixel(test.peaks_mm_dim)[:,1] \
-                   + test.get_origin_pxCorner()[1] \
-                   - test.get_lfa_pxRectangle()[0][1]
+        x_values = self._mm_to_pixel(test.peaks_mm_dim)[:,1] \
+                   + self.get_origin_pxCorner()[1] \
+                   - self.get_lfa_pxRectangle()[0][1]
         return [[int(val - self._mm_to_pixel(PEAK_WINDOW_MM)), int(val + self._mm_to_pixel(PEAK_WINDOW_MM))] for val in x_values]
     
     def set_laminate_image(self, image) -> None:

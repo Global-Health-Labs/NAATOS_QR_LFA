@@ -1,15 +1,18 @@
-from pyzbar.pyzbar import decode, ZBarSymbol
-from qreader import QReader
-import numpy as np
 import cv2
-from itertools import combinations
 import filedialpy
-from scipy.signal import savgol_filter,find_peaks
+from itertools import combinations
+import numpy as np
+from pathlib import Path
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
 from plotly.subplots import make_subplots
-import numpy as np
 from pybaselines import Baseline
+from pyzbar.pyzbar import decode, ZBarSymbol
+from qreader import QReader
+from scipy.signal import savgol_filter,find_peaks
+
+pd.set_option("display.precision", 2)
 
 IMAGE_RESOLUTION_DPI = 300
 PIXEL_PER_MM = IMAGE_RESOLUTION_DPI/25.4
@@ -22,10 +25,10 @@ class ScannerImage:
     def __init__(self, path=None):
         self.qreader = QReader()
         if path is None:
-            self.path=filedialpy.openFile()
+            self.path = Path(filedialpy.openFile())
         else:
-            self.path=path
-        self.image = self.rotate_QR_image(cv2.imread(self.path, cv2.IMREAD_UNCHANGED))
+            self.path = Path(path)
+        self.image = self.rotate_QR_image(cv2.imread(str(self.path), cv2.IMREAD_UNCHANGED))
         self.qrs = self.detect_QR_image(self.image, self.qreader)
         self.annotated = self.image.copy()
 
@@ -45,21 +48,27 @@ class ScannerImage:
     def detect_QR_image(image, qreader):
         data, qrs = qreader.detect_and_decode(image=image, return_detections=True)
         return [dict(qr,**{'data':value}) for value, qr in zip(data, qrs)]
-    
-    def annotate_QR_image(self, type, *args, **kwargs):
-        match type:
-            case 'rectangle':
-                cv2.rectangle(self.annotated, *args, **kwargs)
-            case 'text':
-                cv2.putText(self.annotated, *args, **kwargs)
 
     def create_test_list(self, dx_scale=8):
         dx = self.image.shape[1]/dx_scale
         qrs_y_sorted = sorted(self.qrs, key=lambda x: x['cxcy'][1])
         tests = [TestConsumable(c, b, a) for a, b, c in combinations(qrs_y_sorted, 3) if abs(a['cxcy'][0] - b['cxcy'][0]) <= dx and abs(b['cxcy'][0] - c['cxcy'][0]) <= dx]
         tests = sorted(tests, key=lambda x: x.laminate_QR['cxcy'][0])
+        for qr in qrs_y_sorted:
+            x1, y1, x2, y2 = qr['bbox_xyxy'].astype(int)
+            self.annotated = cv2.rectangle(self.annotated,(x1, y1), (x2, y2), (0, 255, 0), 2)
+            self.annotated = cv2.putText(self.annotated, qr['data'], (int(x1) - 20, int(y1) - 10),
+                                           fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0, 255, 0), thickness=2
+                                          )
+        for i, test in enumerate(tests):
+            self.annotated = cv2.rectangle(self.annotated, *test.get_laminate_pxRectangle(), (255, 0, 0), 2)
+            self.annotated = cv2.rectangle(self.annotated, *test.get_lfa_pxRectangle(), (0, 0, 255), 2)
+            self.annotated = cv2.putText(self.annotated, str(i+1),
+                                         (test.get_laminate_pxRectangle()[0][0] + 10, test.get_laminate_pxRectangle()[0][1] + 30),
+                                         fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(255, 255, 255), thickness=2
+                                        )
         for test in tests:
-            test.set_laminate_image(self.image)
+            test.set_laminate_image(self.annotated)
             test.set_lfa_image(self.image)
         return tests
 
@@ -133,19 +142,19 @@ class TestConsumable:
         peaks_X_by_location, peaks_Y_by_location = zip(*peaks_XY_max)
         return baselined, list(peaks_X_by_location), list(peaks_Y_by_location)
 
-    def process_lfa_image(self, channel):
+    def process_lfa_image(self, channel=2):
         # color channels in OpenCV are BGR so red channel is index 2
         assert channel in [0, 1, 2], 'Allowed color channels are 0 (blue), 1 (green), or 2 (red).'
         line = 255-np.mean(self.lfa_image[:,:,channel], axis=1)
         line_data = self._find_lfa_peaks(line)
         return line_data
     
-    def plot_lfa_results(self, width=500):
-        line, peaks_x, peaks_y = self.process_lfa_image(2)
+    def generate_lfa_results(self, width=500, save_path=None):
+        line, peaks_x, peaks_y = self.process_lfa_image()
         line = np.flip(line)
         peaks_x = [len(line) - px if px is not None else px for px in peaks_x]
         img = cv2.flip(cv2.rotate(self.lfa_image, cv2.ROTATE_180), 1)
-        x_intervals = [[len(line) - x for x in xs] for xs in test.get_peak_intervals()]
+        x_intervals = [[len(line) - x for x in xs] for xs in self.get_peak_intervals()]
         w1=img.shape[1]
         w2=max(line)-min(line)+20
         col_widths = [w1/(w1+w2), w2/(w1+w2)]
@@ -196,20 +205,36 @@ class TestConsumable:
         b1 = self._image_to_nparray(fig, width)
 
         if peaks_y[0] is None:
-            call = '<b>INVALID</b>'
+            test_call = '<b>INVALID</b>'
         elif peaks_y[1] is None and peaks_y[2] is None:
-            call = '<b>INVALID</b>'
+            test_call = '<b>INVALID</b>'
         elif peaks_y[1] is not None and peaks_y[2] is None:
-            call = '<b>NEGATIVE</b>'
+            test_call = '<b>NEGATIVE</b>'
         elif peaks_y[2] is not None:
-            call = '<b>POSTIVE</b>'
+            test_call = '<b>POSITIVE</b>'
         else:
-            call = '<b>?</b>'
-        table_data = [['region', 'Flow Control Line', 'IPC Line', 'Test Line', 'Background',''],
-                    ['peak intensity value']+[peak_y if peak_y is None else np.round(peak_y, decimals=2) for peak_y in peaks_y]+[''],
-                    ['algorithm call']+['<b>NOT DETECTED</b>' if peak_y is None else '<b>DETECTED</b>' for peak_y in peaks_y[:3]]+['', call]
-        ]
-        fig = ff.create_table([list(row) for row in zip(*table_data)])
+            test_call = '<b>?</b>'
+        table_peaks = peaks_y + ['']
+        table_calls = ['<b>NOT DETECTED</b>' if peak_y is None else '<b>DETECTED</b>' for peak_y in peaks_y[:3]] + ['', test_call]
+        table_labels = ['Flow Control Line', 'IPC Line', 'Test Line', 'Background (µ + 3σ)', self.condition_QR['data']]
+        table_df = pd.DataFrame({'region': table_labels,
+                    'peak intensity value': table_peaks,
+                    'algorithm call': table_calls
+        })
+        if save_path is not None:
+            output_peaks = peaks_y[:3]
+            output_calls = [n for n in table_calls if n != '']
+            output_labels = ['FC intensity', 'IPC intensity', 'TL intensity', 'FC call', 'IPC call', 'TL call', 'test call']
+            output_df = pd.DataFrame({self.condition_QR['data']: output_peaks + output_calls},
+                                    index=output_labels
+                                    )
+            csv_save_path = save_path.parent / f'{save_path.parts[-2]}.csv'
+            if csv_save_path.exists():
+                input_df = pd.read_csv(str(csv_save_path), index_col=0)
+                pd.concat([input_df, output_df], axis=1).to_csv(str(csv_save_path))
+            else:
+                output_df.to_csv(str(csv_save_path))
+        fig = ff.create_table(table_df)
         fig.update_layout(
             autosize=False,
             width=500,
@@ -234,7 +259,7 @@ class TestConsumable:
 
 def show_cv2_image(image, scale=0.5, title=None):
     if title is None:
-        title = f'image 0'
+        title = f'image 1'
     cv2.imshow(title, cv2.resize(image, None, fx=scale, fy=scale))
     cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
     cv2.moveWindow(title, 0, 0)
@@ -247,11 +272,17 @@ def show_cv2_image(image, scale=0.5, title=None):
             break
     cv2.destroyAllWindows()
 
-def show_cv2_images(images, scales=0.5, titles=None):
+def show_cv2_images(images, scales=None, titles=None, save_paths=None):
     if titles is None:
-        titles = [f'image {i}' for i in range(len(images))]
-    for i, image in enumerate(images):
-        cv2.imshow(titles[i], cv2.resize(image, None, fx=scales[i], fy=scales[i]))
+        titles = [f'image {i+1}' for i in range(len(images))]
+    if scales is None:
+        scales = [1]*len(images)
+    for i in range(len(images)):
+        img = cv2.resize(images[i], None, fx=scales[i], fy=scales[i])
+        if save_paths[i] is not None:
+            img_save_path = save_paths[i].parent / f'{save_paths[i].stem} - {titles[i]}.png'
+            cv2.imwrite(img_save_path, img)
+        cv2.imshow(titles[i], img)
         cv2.setWindowProperty(titles[i], cv2.WND_PROP_TOPMOST, 1)
         cv2.moveWindow(titles[i], i*300, 0)
     windows_open = True
@@ -264,22 +295,9 @@ def show_cv2_images(images, scales=0.5, titles=None):
             windows_open = False
     cv2.destroyAllWindows()
 
-# scanned = ScannerImage('C:\\Users\\JoshuaBishop\\Downloads\\20250319 autoexposure document005.tif')
-# scanned = ScannerImage('C:\\Users\\JoshuaBishop\\Global Health Labs, Inc\\NAATOS Product Feasibility - General - Internal - General - Internal\\Data\\NAATOS 2025 Stage Gate 4\\Clinical Study\\20250325 Clinical Samples\\20250325 Clinical Sample_09.tif')
 scanned = ScannerImage()
 tests = scanned.create_test_list()
-print(f'{len(tests)} test consumables identified in the image at {scanned.path}.')
-
-for qr in scanned.qrs:
-    x1, y1, x2, y2 = qr['bbox_xyxy'].astype(int)
-    scanned.annotate_QR_image('rectangle', (x1, y1), (x2, y2), (0, 255, 0), 2)
-    scanned.annotate_QR_image('text', qr['data'], (int(x1), int(y1) - 10), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1, color=(0, 255, 0), thickness=2)
-for i, test in enumerate(tests):
-    scanned.annotate_QR_image('rectangle', *test.get_laminate_pxRectangle(), (255, 0, 0), 2)
-    scanned.annotate_QR_image('rectangle', *test.get_lfa_pxRectangle(), (0, 0, 255), 2)
-    scanned.annotate_QR_image('text', str(i+1), (test.get_laminate_pxRectangle()[0][0] + 10, test.get_laminate_pxRectangle()[0][1] + 30),
-                              fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(255, 255, 255), thickness=2)
-
+n_tests = len(tests)
+print(f'{n_tests} test consumables identified in the image at {scanned.path}.')
 if True:
-    show_cv2_images([scanned.annotated]+[test.plot_lfa_results() for test in tests], [0.5, 1, 1])
+    show_cv2_images([test.generate_lfa_results(save_path=scanned.path) for test in tests], scales=[1]*n_tests, save_paths=[scanned.path]*n_tests)
